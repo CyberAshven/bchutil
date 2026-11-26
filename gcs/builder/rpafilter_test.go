@@ -510,6 +510,56 @@ func TestRPAFilterKSmallest(t *testing.T) {
 	}
 }
 
+// TestRPAFilterMainnet checks the value of a real payment to a reusable
+// payment address: mainnet transaction
+// 73df724caf64c5df016c8cb5a255def1ba09bc41a26bf77e368c913a156bf724, in block
+// 893146 (000000000000000000cfc3785c2574200a7dfe4f511ecfb023ad6c8fbfb327ec),
+// which pays the paycode Fulcrum's README lists for donations,
+// paycode:qygqyce24f7n6q2u36r8t332z5426ul78v7z0ynl6v9wlmk9tt28adksqgc0fzge8fk6ux8cj9tjvp8mkakvfzkgwqzj5h4n9tnfcpscsn7wxqqqqqqqzzmxze04.
+// That paycode has a prefix size of 16 bits and the scan key
+// 02632aaa7d3d015c8e8675c62a152aad73fe3b3c27927fd30aefeec55ad47eb6d0, so the
+// receiver's prefix is 632a, the 16 bits after the key's first byte. Electron
+// Cash grinds the first input, here the only one, and the transaction has its
+// marks: a Schnorr signature with sighash 0x41, sequence 0xfffffffe and a lock
+// time one below its block's height. The output it paid was later spent with
+// an uncompressed key, as Electron Cash derives the keys of paycode payments,
+// together with the outputs of two more transactions whose first inputs give
+// 632a as well.
+func TestRPAFilterMainnet(t *testing.T) {
+	raw := rpaHex(t, "0100000001bbee41aa77666586111fe562ba679731b2ba493002ab552b31a1dcf2a1e828903e0000006441"+
+		"b7a2b648f1d1f0b0d51691f424dffb840f8d5bad1ffe07d1684e20f6843c7ef79fd660827e4d3959472fe4d1198d8f6c"+
+		"152799aa3ee652aa477d13b914eaa14e4121028be3c38f3333ccdf44c411ad257c2b75ddae455daf557cb862fb51d22e"+
+		"f72f74feffffff02f05b7c00000000001976a914b8f55d367cfd0891083c1af0bee39a2e81361a0788ac809698000000"+
+		"00001976a914d2f9ba1f2be88a3b731d78566c6f2e183c0f16c888acd9a00d00")
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	if id := tx.TxHash().String(); id != "73df724caf64c5df016c8cb5a255def1ba09bc41a26bf77e368c913a156bf724" {
+		t.Fatalf("transaction ID %s", id)
+	}
+	if v := builder.RPAInputValue(tx.TxIn[0]); v != 0x632a {
+		t.Fatalf("the first input's value is %04x, want the receiver's prefix 632a", v)
+	}
+	values := builder.RPAValues([]*wire.MsgTx{&tx})
+	filter := encodeRPA(t, values)
+	decoded, err := builder.DecodeRPAFilter(filter)
+	if err != nil || !slices.Equal(decoded, []uint16{0x632a}) {
+		t.Fatalf("filter %x decodes to %04x, %v", filter, decoded, err)
+	}
+	for _, p := range []struct {
+		prefix uint16
+		bits   uint8
+	}{{0x632a, 16}, {0x632, 12}, {0x63, 8}, {0x6, 4}} {
+		if !builder.RPAFilterMatch(decoded, p.prefix, p.bits) {
+			t.Errorf("the filter doesn't match the receiver's prefix %x of %d bits", p.prefix, p.bits)
+		}
+	}
+	if builder.RPAFilterMatch(decoded, 0x632b, 16) {
+		t.Error("the filter matches another 16-bit prefix")
+	}
+}
+
 // TestRPAFilterMatch checks prefixes of 4, 8, 12 and 16 bits against values
 // at the edges of their ranges.
 func TestRPAFilterMatch(t *testing.T) {
