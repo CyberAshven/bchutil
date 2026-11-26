@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The bchd developers
+// Copyright (c) 2026 The gcash developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
