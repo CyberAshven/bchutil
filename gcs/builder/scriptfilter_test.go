@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The bchd developers
+// Copyright (c) 2026 The gcash developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -168,6 +168,47 @@ func TestTxidKey(t *testing.T) {
 	}
 	if builder.CategoryKey(*txid) == key || builder.ScriptKey(txid[:]) == key {
 		t.Fatal("a transaction's key equals the key of its ID as a category or a script")
+	}
+}
+
+// TestKeyOfAnotherKind checks what the tags keep apart and what they don't.
+// A category's key and a transaction's key differ for the same ID, but a
+// script key hashes any script with no tag, so the script 0x01 || c has the
+// key of category c and the script 0x02 || t the key of transaction t. A
+// block with an output of that script then holds an output leaf under the
+// transaction's key, beside the transaction's own leaf, and only the kind
+// tells them apart.
+func TestKeyOfAnotherKind(t *testing.T) {
+	block, prevOutScripts := scriptFilterBlock()
+	txid := block.Transactions[1].TxHash()
+	if builder.CategoryKey(txid) == builder.TxidKey(txid) {
+		t.Fatal("a category's key equals the key of the transaction with its ID")
+	}
+	if builder.CategoryKey(categoryC) != builder.ScriptKey(append([]byte{0x01}, categoryC[:]...)) {
+		t.Fatal("a category's key is not the key of the script 0x01 || category")
+	}
+	if builder.TxidKey(txid) != builder.ScriptKey(append([]byte{0x02}, txid[:]...)) {
+		t.Fatal("a transaction's key is not the key of the script 0x02 || ID")
+	}
+
+	block.Transactions[2].TxOut[0].PkScript = append([]byte{0x02}, txid[:]...)
+	leaves, err := builder.ScriptLeaves(block, prevOutScripts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := builder.TxidKey(txid)
+	var under []builder.ScriptLeaf
+	for _, leaf := range leaves {
+		if leaf.Key == key {
+			under = append(under, leaf)
+		}
+	}
+	want := []builder.ScriptLeaf{
+		{Key: key, TxIndex: 1, Kind: builder.ScriptLeafTransaction},
+		{Key: key, TxIndex: 2, Kind: builder.ScriptLeafOutput},
+	}
+	if len(under) != len(want) || under[0] != want[0] || under[1] != want[1] {
+		t.Errorf("leaves under the transaction's key: %+v, want %+v", under, want)
 	}
 }
 
