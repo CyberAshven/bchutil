@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The bchd developers
+// Copyright (c) 2026 The gcash developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -19,6 +19,9 @@ import (
 // before it and the leaf just after it, also shows that a tree whose leaves
 // are in order holds no other leaf with that prefix. A run of one leaf is
 // that leaf's branch.
+//
+// A node answers with a ScriptTree, which builds a block's tree once, and a
+// client checks the answer with CheckScriptRange.
 
 var (
 	// ErrScriptLeaf is returned for a serialized leaf of the wrong size or
@@ -113,32 +116,157 @@ func ScriptLeavesWithPrefix(leaves []ScriptLeaf, prefix *[32]byte, bits uint16) 
 	return first, end, nil
 }
 
-// ScriptRangeHashes returns the hashes that, with the run leaves[lo:end],
-// rebuild the root of the tree over leaves. Level by level from the leaves
-// up, they are the node just left of the run's first node, then the node just
-// right of its last node, wherever the run doesn't already reach it. A last
-// node without a partner moves up unchanged and needs none.
-func ScriptRangeHashes(leaves []ScriptLeaf, lo, end int) ([]chainhash.Hash, error) {
-	if lo < 0 || lo >= end || end > len(leaves) {
-		return nil, ErrScriptRange
+// ScriptTree is a block's entry tree with its levels above the leaves built
+// once, so that a node answers every range and branch of the block by reading
+// a few hashes for each level, instead of hashing the whole tree again for
+// each request. Besides the leaves it holds about one hash for each leaf.
+// Nothing changes it after NewScriptTree returns, so goroutines may share
+// one.
+type ScriptTree struct {
+	leaves []ScriptLeaf
+
+	// upper holds the levels above the leaves, from the leaves' parents up
+	// to the root. A node without a partner moves up unchanged.
+	upper [][]chainhash.Hash
+}
+
+// NewScriptTree builds the tree over sorted leaves, as ScriptLeaves returns
+// them. The tree keeps leaves, which the caller doesn't change afterwards.
+func NewScriptTree(leaves []ScriptLeaf) *ScriptTree {
+	t := &ScriptTree{leaves: leaves}
+	if len(leaves) < 2 {
+		return t
 	}
 	level := make([]chainhash.Hash, len(leaves))
 	for i := range leaves {
 		level[i] = ScriptLeafHash(&leaves[i])
 	}
-	var hashes []chainhash.Hash
-	a, b := lo, end-1
 	for len(level) > 1 {
+		next := make([]chainhash.Hash, 0, (len(level)+1)/2)
+		for i := 0; i < len(level); i += 2 {
+			if i+1 == len(level) {
+				next = append(next, level[i])
+				continue
+			}
+			next = append(next, ScriptNodeHash(&level[i], &level[i+1]))
+		}
+		t.upper = append(t.upper, next)
+		level = next
+	}
+	return t
+}
+
+// Leaves returns the tree's leaves, in order. The caller doesn't change
+// them.
+func (t *ScriptTree) Leaves() []ScriptLeaf {
+	return t.leaves
+}
+
+// Root returns the root of the tree, the same that ScriptLeavesRoot gives:
+// the zero hash for a tree without leaves.
+func (t *ScriptTree) Root() chainhash.Hash {
+	switch {
+	case len(t.leaves) == 0:
+		return chainhash.Hash{}
+	case len(t.upper) == 0:
+		return ScriptLeafHash(&t.leaves[0])
+	default:
+		return t.upper[len(t.upper)-1][0]
+	}
+}
+
+// node returns the node at index of a level of the tree, level 0 being the
+// leaves.
+func (t *ScriptTree) node(level, index int) chainhash.Hash {
+	if level == 0 {
+		return ScriptLeafHash(&t.leaves[index])
+	}
+	return t.upper[level-1][index]
+}
+
+// RangeHashes returns the hashes that, with the run of leaves from index lo
+// up to end, rebuild the root. Level by level from the leaves up, they are
+// the node just left of the run's first node, then the node just right of
+// its last node, wherever the run doesn't already reach it. A last node
+// without a partner moves up unchanged and needs none.
+func (t *ScriptTree) RangeHashes(lo, end int) ([]chainhash.Hash, error) {
+	if lo < 0 || lo >= end || end > len(t.leaves) {
+		return nil, ErrScriptRange
+	}
+	var hashes []chainhash.Hash
+	a, b, width := lo, end-1, len(t.leaves)
+	for level := 0; width > 1; level++ {
 		if a%2 == 1 {
-			hashes = append(hashes, level[a-1])
+			hashes = append(hashes, t.node(level, a-1))
 		}
-		if b%2 == 0 && b+1 < len(level) {
-			hashes = append(hashes, level[b+1])
+		if b%2 == 0 && b+1 < width {
+			hashes = append(hashes, t.node(level, b+1))
 		}
-		level = scriptNextLevel(level)
-		a, b = a/2, b/2
+		a, b, width = a/2, b/2, (width+1)/2
 	}
 	return hashes, nil
+}
+
+// ScriptRange is a range of a block's entry tree, as a node answers a key
+// prefix: the tree's leaf count, the run of leaves whose keys start with the
+// prefix and the index of its first leaf, the leaves just before and just
+// after the run where the tree has them, and the hashes that rebuild the
+// root with those leaves.
+type ScriptRange struct {
+	Count  uint32
+	First  uint32
+	Run    []ScriptLeaf
+	Before *ScriptLeaf
+	After  *ScriptLeaf
+	Hashes []chainhash.Hash
+}
+
+// Range returns the range of the tree for the keys that start with the first
+// bits of prefix. When no leaf has the prefix, the run is empty and First is
+// the place where such a leaf would sit. The range's leaves are the tree's
+// own, which the caller doesn't change.
+func (t *ScriptTree) Range(prefix *[32]byte, bits uint16) (*ScriptRange, error) {
+	first, end, err := ScriptLeavesWithPrefix(t.leaves, prefix, bits)
+	if err != nil {
+		return nil, err
+	}
+	r := &ScriptRange{
+		Count: uint32(len(t.leaves)),
+		First: uint32(first),
+		Run:   t.leaves[first:end:end],
+	}
+	lo, hi := first, end
+	if first > 0 {
+		r.Before = &t.leaves[first-1]
+		lo--
+	}
+	if end < len(t.leaves) {
+		r.After = &t.leaves[end]
+		hi++
+	}
+	if lo < hi {
+		if r.Hashes, err = t.RangeHashes(lo, hi); err != nil {
+			return nil, err
+		}
+	}
+	return r, nil
+}
+
+// Check checks the range against the root in front of the block's script
+// filter, with CheckScriptRange.
+func (r *ScriptRange) Check(root chainhash.Hash, prefix *[32]byte, bits uint16) error {
+	return CheckScriptRange(root, r.Count, r.First, r.Run, r.Before, r.After, r.Hashes, prefix, bits)
+}
+
+// ScriptRangeHashes returns the hashes that, with the run leaves[lo:end],
+// rebuild the root of the tree over leaves, as ScriptTree.RangeHashes does.
+// It builds the tree for this one run: a node that answers several runs of a
+// block keeps a ScriptTree instead.
+func ScriptRangeHashes(leaves []ScriptLeaf, lo, end int) ([]chainhash.Hash, error) {
+	if lo < 0 || lo >= end || end > len(leaves) {
+		return nil, ErrScriptRange
+	}
+	return NewScriptTree(leaves).RangeHashes(lo, end)
 }
 
 // ScriptRangeRoot rebuilds the root of a tree of count leaves from a run of
@@ -188,6 +316,26 @@ func ScriptRangeRoot(count, lo uint32, run []ScriptLeaf, hashes []chainhash.Hash
 // the prefix. The leaves the reply doesn't show are not checked here. A tree
 // with leaves out of order is not the one the block gives, and has another
 // root.
+//
+// The count and the first index are the peer's word, but a wrong one doesn't
+// let it hide a leaf. A leaf's hash can't pass for an inner node's, since the
+// two are hashed with different tags, so leaves and hashes that rebuild the
+// root follow the real tree's shape whatever count they claim. The hashes a
+// reply supplies sit outside its leaves, never between two of them, so its
+// leaves are consecutive leaves of the tree. A leaf it gives as the first,
+// with no leaf before it, sits on the path that goes left at every level, so
+// it is the tree's first leaf, and a leaf it gives as the last, with no leaf
+// after it, sits on the path that goes right at every level, so it is the
+// tree's last. A reply that claims fewer leaves than the tree has, so as to
+// drop its last leaves, therefore rebuilds another root.
+//
+// The check is of where the leaves sit and which keys they have, not of what
+// a key stands for. A token category's or a transaction's key can also be a
+// script's key (see ScriptKey), so the run for TxidKey(t) can hold a
+// ScriptLeafOutput leaf of an output whose script is 0x02 || t. A caller
+// checks each leaf's Kind: a client that looks a transaction up takes it as
+// confirmed only from the leaf ScriptTxidLeaf finds, and a non-empty run
+// says nothing by itself.
 //
 // ErrScriptRangeRoot means the reply doesn't belong to that root.
 // ErrScriptRangeLeaves means the leaves do rebuild the root, so they are the
@@ -248,4 +396,20 @@ func CheckScriptRange(root chainhash.Hash, count, first uint32, run []ScriptLeaf
 		}
 	}
 	return nil
+}
+
+// ScriptTxidLeaf returns the leaf of a transaction's own ID among the leaves
+// of a run: the leaf of kind ScriptLeafTransaction whose key is
+// TxidKey(txid). It reports false when the run has none. The run for that
+// key can also hold leaves of other kinds, an output whose script is
+// 0x02 || txid for one (see ScriptKey), and those say nothing of the
+// transaction.
+func ScriptTxidLeaf(run []ScriptLeaf, txid chainhash.Hash) (ScriptLeaf, bool) {
+	key := TxidKey(txid)
+	for _, leaf := range run {
+		if leaf.Kind == ScriptLeafTransaction && leaf.Key == key {
+			return leaf, true
+		}
+	}
+	return ScriptLeaf{}, false
 }
