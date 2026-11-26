@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The bchd developers
+// Copyright (c) 2026 The gcash developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -24,8 +24,10 @@ import (
 //
 // The filter is the set of the first two bytes of the double SHA-256 of each
 // of the first 30 inputs of every transaction of the block but the coinbase,
-// as 16-bit values, sorted and each kept once, Rice coded with a parameter
-// that follows from their number, so that every node gives the same bytes. It
+// as 16-bit values, sorted and each kept once. Its count comes first, then a
+// byte that follows from the count alone and says how the values are coded:
+// Rice coded gaps with that byte as the parameter, or, for 19,197 values and
+// more, a bitmap of every 16-bit value. So every node gives the same bytes. It
 // is built from the block alone.
 
 const (
@@ -37,14 +39,33 @@ const (
 	// hold: every 16-bit value.
 	RPAFilterMaxValues = 1 << 16
 
-	// rpaFilterKScale is round(65536 * ln 2), from which the Rice parameter
-	// for a number of values follows.
-	rpaFilterKScale = 45426
+	// RPAFilterBitmap is the byte after the count of a filter whose values
+	// are a bitmap rather than Rice coded.
+	RPAFilterBitmap = 16
+
+	// RPAFilterBitmapFrom is the smallest count whose filter is a bitmap.
+	// From there on every Rice parameter takes more bits than the bitmap's
+	// 65,536 for values drawn at random.
+	RPAFilterBitmapFrom = 19197
+
+	// rpaFilterBitmapBytes is the size of a bitmap of every 16-bit value.
+	rpaFilterBitmapBytes = RPAFilterMaxValues / 8
 )
+
+// rpaFilterKFrom holds, for each Rice parameter k from 1 to 15 at index k,
+// the smallest count that takes it. A count takes the smallest k whose start
+// is not above it. Each k is the one that codes that many distinct values
+// drawn at random in the fewest bits on average, worked out exactly from the
+// distribution of their gaps, the first gap from 0. At the one tie, one
+// value, where k = 14 and k = 15 both take 16.5 bits, the larger k is taken.
+// No count takes k = 0: from 19,197 values on the bitmap is smaller.
+var rpaFilterKFrom = [16]int{
+	0, 18055, 8356, 4051, 1997, 992, 494, 246, 123, 61, 30, 15, 7, 3, 2, 1,
+}
 
 var (
 	// ErrRPAFilterTruncated is returned for filter bytes that end before
-	// the count, the parameter or the values they promise.
+	// the count, the coding byte or the values they promise.
 	ErrRPAFilterTruncated = errors.New("input prefix filter ends early")
 
 	// ErrRPAFilterCount is returned for a count not in its shortest
@@ -52,8 +73,9 @@ var (
 	ErrRPAFilterCount = errors.New("input prefix filter count is not in its " +
 		"shortest form or is above 65,536")
 
-	// ErrRPAFilterK is returned for a Rice parameter other than the one the
-	// count gives, so that a set of values has one encoding.
+	// ErrRPAFilterK is returned for a coding byte, a Rice parameter or the
+	// bitmap's, other than the one the count gives, so that a set of values
+	// has one encoding.
 	ErrRPAFilterK = errors.New("input prefix filter parameter is not the one " +
 		"its count gives")
 
@@ -64,11 +86,21 @@ var (
 	// ErrRPAFilterValue is returned for a value above 65,535.
 	ErrRPAFilterValue = errors.New("input prefix filter value is above 65,535")
 
+	// ErrRPAFilterBitmapCount is returned for a bitmap that holds another
+	// number of values than the filter's count.
+	ErrRPAFilterBitmapCount = errors.New("input prefix filter bitmap holds " +
+		"another number of values than its count")
+
 	// ErrRPAFilterPadding is returned for a set bit after the last value.
 	ErrRPAFilterPadding = errors.New("input prefix filter padding is not zero")
 
 	// ErrRPAFilterTrailing is returned for bytes after the last value's.
 	ErrRPAFilterTrailing = errors.New("input prefix filter has trailing bytes")
+
+	// ErrRPAFilterValues is returned by EncodeRPAFilter for values that are
+	// not sorted or not distinct.
+	ErrRPAFilterValues = errors.New("input prefix filter values are not " +
+		"sorted and distinct")
 )
 
 // RPAInputValue returns the value of an input in the input prefix filter: the
@@ -129,14 +161,23 @@ func RPABlockValues(block *wire.MsgBlock) []uint16 {
 	return RPAValues(block.Transactions[1:])
 }
 
-// RPAFilterK returns the Rice parameter of a filter of n values, n above 0:
-// floor(log2(floor(45426 / n))), or 0 when that quotient is 0.
+// RPAFilterK returns the coding byte of a filter of n values, the byte after
+// its count: RPAFilterBitmap for RPAFilterBitmapFrom values or more, and
+// otherwise the Rice parameter, 1 to 15, from the counts where each starts.
+// Only a count from 1 to 65,536 has one, since a filter without values has no
+// coding byte. For any other n it returns 0, which no filter takes.
 func RPAFilterK(n int) uint8 {
-	q := rpaFilterKScale / n
-	if q == 0 {
+	switch {
+	case n < 1 || n > RPAFilterMaxValues:
 		return 0
+	case n >= RPAFilterBitmapFrom:
+		return RPAFilterBitmap
 	}
-	return uint8(bits.Len(uint(q)) - 1)
+	for k := 1; ; k++ {
+		if n >= rpaFilterKFrom[k] {
+			return uint8(k)
+		}
+	}
 }
 
 // rpaBitWriter packs bits most significant first.
@@ -164,18 +205,40 @@ func (w *rpaBitWriter) flush() []byte {
 	return w.out
 }
 
-// EncodeRPAFilter encodes the values of an input prefix filter, which must be
-// sorted and distinct: their count as CompactSize, then, when there are any,
-// the Rice parameter and each gap from the value before (the first from 0),
-// Rice coded and packed most significant bit first.
-func EncodeRPAFilter(values []uint16) []byte {
+// EncodeRPAFilter encodes the values of an input prefix filter: their count
+// as CompactSize, then, when there are any, the coding byte RPAFilterK gives
+// for the count and the values. Rice coded values are the gaps from the value
+// before (the first from 0), each as its quotient in one bits and a zero bit,
+// then its low k bits, packed most significant bit first, the last byte
+// padded with zero bits. A bitmap is 8,192 bytes, in which value v is bit
+// 7 - v%8 of byte v/8. It returns ErrRPAFilterValues for values that are not
+// sorted and distinct.
+func EncodeRPAFilter(values []uint16) ([]byte, error) {
+	for i := 1; i < len(values); i++ {
+		if values[i] <= values[i-1] {
+			return nil, ErrRPAFilterValues
+		}
+	}
+	return encodeRPAFilter(values), nil
+}
+
+// encodeRPAFilter encodes values that are sorted and distinct.
+func encodeRPAFilter(values []uint16) []byte {
 	var count bytes.Buffer
 	_ = wire.WriteVarInt(&count, 0, uint64(len(values)))
 	if len(values) == 0 {
 		return count.Bytes()
 	}
 	k := RPAFilterK(len(values))
-	w := rpaBitWriter{out: append(count.Bytes(), k)}
+	out := append(count.Bytes(), k)
+	if k == RPAFilterBitmap {
+		bitmap := make([]byte, rpaFilterBitmapBytes)
+		for _, v := range values {
+			bitmap[v/8] |= 0x80 >> (v % 8)
+		}
+		return append(out, bitmap...)
+	}
+	w := rpaBitWriter{out: out}
 	var prev uint32
 	for _, v := range values {
 		d := uint32(v) - prev
@@ -193,7 +256,8 @@ func EncodeRPAFilter(values []uint16) []byte {
 
 // BuildRPAFilter returns a block's input prefix filter, encoded.
 func BuildRPAFilter(block *wire.MsgBlock) []byte {
-	return EncodeRPAFilter(RPABlockValues(block))
+	// RPABlockValues gives the values sorted and distinct.
+	return encodeRPAFilter(RPABlockValues(block))
 }
 
 // rpaBitReader reads bits most significant first.
@@ -212,11 +276,11 @@ func (r *rpaBitReader) bit() (bool, bool) {
 }
 
 // DecodeRPAFilter decodes an input prefix filter into its values, in order.
-// It refuses a count not in its shortest form or above 65,536, a parameter
+// It refuses a count not in its shortest form or above 65,536, a coding byte
 // other than the one the count gives, a value repeated or above 65,535, fewer
-// values than the count, a set padding bit and trailing bytes, so that the
-// bytes it takes are the one encoding of their values, the one
-// EncodeRPAFilter gives.
+// values than the count, a bitmap that holds another number of values, a
+// set padding bit and trailing bytes, so that the bytes it takes are the one
+// encoding of their values, the one EncodeRPAFilter gives.
 func DecodeRPAFilter(b []byte) ([]uint16, error) {
 	r := bytes.NewReader(b)
 	n, err := wire.ReadVarInt(r, 0)
@@ -245,6 +309,9 @@ func DecodeRPAFilter(b []byte) ([]uint16, error) {
 	k := rest[0]
 	if k != RPAFilterK(int(n)) {
 		return nil, ErrRPAFilterK
+	}
+	if k == RPAFilterBitmap {
+		return decodeRPABitmap(rest[1:], int(n))
 	}
 	br := rpaBitReader{b: rest[1:]}
 	values := make([]uint16, 0, n)
@@ -293,6 +360,32 @@ func DecodeRPAFilter(b []byte) ([]uint16, error) {
 	for br.pos < used*8 {
 		if one, _ := br.bit(); one {
 			return nil, ErrRPAFilterPadding
+		}
+	}
+	return values, nil
+}
+
+// decodeRPABitmap decodes the bitmap of a filter of n values.
+func decodeRPABitmap(bitmap []byte, n int) ([]uint16, error) {
+	switch {
+	case len(bitmap) < rpaFilterBitmapBytes:
+		return nil, ErrRPAFilterTruncated
+	case len(bitmap) > rpaFilterBitmapBytes:
+		return nil, ErrRPAFilterTrailing
+	}
+	count := 0
+	for _, b := range bitmap {
+		count += bits.OnesCount8(b)
+	}
+	if count != n {
+		return nil, ErrRPAFilterBitmapCount
+	}
+	values := make([]uint16, 0, n)
+	for i, b := range bitmap {
+		for b != 0 {
+			j := bits.LeadingZeros8(b)
+			values = append(values, uint16(i*8+j))
+			b &^= 0x80 >> j
 		}
 	}
 	return values, nil
