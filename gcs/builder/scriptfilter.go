@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The bchd developers
+// Copyright (c) 2026 The gcash developers
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
@@ -37,7 +37,9 @@ import (
 // output index (0 for a transaction's own leaf), and the kind.
 const ScriptLeafSize = 32 + 4 + 4 + 1
 
-// ScriptLeafKind says what a leaf's key comes from.
+// ScriptLeafKind says what a leaf's key comes from. The key alone doesn't
+// say it, since a script's key can equal a category's or a transaction's (see
+// ScriptKey).
 type ScriptLeafKind uint8
 
 const (
@@ -107,13 +109,23 @@ func cmpUint32(a, b uint32) int {
 // ScriptKey returns the key of a locking script: its SHA-256, the script hash
 // the Electrum Cash protocol uses. The script is the bare locking script,
 // without a token prefix.
+//
+// A script key hashes any script with no tag in front, so it can equal the
+// key of a token category or of a transaction: CategoryKey(c) is the key of
+// the script 0x01 || c, and TxidKey(t) the key of the script 0x02 || t. An
+// output script of 33 bytes like these is valid by consensus, if
+// nonstandard, so whoever gets one mined puts a ScriptLeafOutput leaf under
+// the key of any category or transaction. The leaves under a key can thus be
+// of any kind, and a client that looks a key up checks each leaf's kind as
+// well as its key.
 func ScriptKey(script []byte) [32]byte {
 	return sha256.Sum256(script)
 }
 
 // CategoryKey returns the key of a token category: the SHA-256 of 0x01
 // followed by the category as it appears in a token prefix. The tag keeps a
-// category key from ever equalling a script key.
+// category key apart from a transaction's key, whose tag is 0x02, but not
+// from a script key, which has no tag (see ScriptKey).
 func CategoryKey(category [32]byte) [32]byte {
 	var b [33]byte
 	b[0] = 0x01
@@ -123,8 +135,10 @@ func CategoryKey(category [32]byte) [32]byte {
 
 // TxidKey returns the key of a transaction: the SHA-256 of 0x02 followed by
 // its ID in internal byte order, as an outpoint holds it. A token category is
-// the ID of the transaction that created it, so the tag keeps a transaction's
-// key apart from the key of the category it created.
+// a transaction's ID too: that of the transaction whose output 0 the genesis
+// transaction's first input spends. So the tag keeps the key of a
+// transaction apart from the key of the category that has its ID. It doesn't
+// keep it apart from a script key (see ScriptKey).
 func TxidKey(txid chainhash.Hash) [32]byte {
 	var b [33]byte
 	b[0] = 0x02
